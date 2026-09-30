@@ -587,7 +587,10 @@ function applyParsedKB(parsed, sourceLabel){
     return false;
   }
   state.kb = parsed;
-  state.query=""; state.scopeField="ALL"; state.activeSection=null; state.activeComplaintType=null;
+  state.query=""; state.activeSection=null;
+  var ctIdx = -1;
+  parsed.fieldOrder.forEach(function(f, i){ if (ctIdx < 0 && /complaint\s*type/i.test(f.key)) ctIdx = i; });
+  state.scopeField = ctIdx >= 0 ? String(ctIdx) : "ALL"; state.activeComplaintType=null;
   state.expandedSections = {}; state.openRecordId = null;
   render();
   saveToast("Imported " + parsed.records.length + " cases from " + sourceLabel);
