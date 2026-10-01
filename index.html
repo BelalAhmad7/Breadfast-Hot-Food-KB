@@ -372,6 +372,24 @@
     .drawer{ top:0; bottom:0; left:0; right:0; width:100vw; transform:translateY(10px); border-radius:0; }
     .drawer.show{ transform:translateY(0); }
   }
+
+  .tabbar{display:flex;justify-content:safe center;gap:6px;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel);overflow-x:auto;flex-shrink:0}
+  .tab{background:none;border:1px solid transparent;color:var(--muted);font-size:12.5px;font-weight:600;padding:6px 13px;border-radius:999px;white-space:nowrap;cursor:pointer}
+  .tab:hover{background:var(--panel-2)}
+  .tab.active{background:var(--accent-dim);color:var(--accent-contrast);border-color:var(--accent)}
+  .viewsw{display:inline-flex;gap:2px;margin-bottom:12px;padding:2px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+  .viewsw button{background:none;border:none;color:var(--muted);font-size:12px;font-weight:600;padding:5px 12px;border-radius:6px;cursor:pointer}
+  .viewsw button.on{background:var(--accent-dim);color:var(--accent-contrast)}
+  .body.no-sidebar .sidebar{display:none}
+  .xt-wrap{overflow:auto;border:1px solid var(--line);border-radius:10px;background:var(--panel);max-height:calc(100vh - 190px)}
+  .xt{border-collapse:collapse;width:100%;font-size:12.5px}
+  .xt th,.xt td{border:1px solid var(--line);padding:8px 10px;vertical-align:top;min-width:110px;max-width:440px;white-space:pre-wrap;text-align:start}
+  .xt th{background:var(--panel-2);font-weight:700}
+  .xt tr:first-child th{position:sticky;top:0;z-index:1}
+  .xt td.xt-title{font-weight:700;font-size:14px;background:var(--panel-2)}
+  .xt-clamp{max-height:9em;overflow:hidden}.xt-clamp.open{max-height:none}
+  .xt-more{background:none;border:none;color:var(--accent-contrast);font-size:11px;font-weight:600;padding:4px 0 0;cursor:pointer}
+  .xt a,.field-value a,.note-block a{color:var(--accent-contrast);text-decoration:underline}
 </style>
 </head>
 <body>
@@ -394,6 +412,8 @@ var state = {
   sidebarOpen: false,
   theme: "light",
   pasteOpen: false,
+  workbook: null,         // set only when a whole .xlsx is uploaded (tabs); pasted data leaves it null
+  activeTab: 0,
 };
 
 var THEME_KEY = "kb-theme";
@@ -447,7 +467,42 @@ function fieldByKey(key){
   var f = state.kb.fieldOrder.find(function(f){ return f.key === key; });
   return f;
 }
+function linkify(h){
+  return h.replace(/https?:\/\/[^\s<]+/g, function(u){
+    var t = "", m = u.match(/(&quot;|&#39;|&lt;|&gt;|[.,;:!?)\]])+$/);
+    if (m){ t = m[0]; u = u.slice(0, u.length - t.length); }
+    return '<a href="'+u+'" target="_blank" rel="noopener noreferrer">'+u+'</a>'+t;
+  });
+}
+function primaryValue(rec){
+  var pk = state.kb && state.kb.primaryKey;
+  return pk ? (rec.fields[pk] || "") : fieldValue(rec, "Complaint Type");
+}
+function descValue(rec){
+  var dk = state.kb && state.kb.descKey;
+  return dk ? (rec.fields[dk] || "") : fieldValue(rec, "Description");
+}
+function finalizeKB(p){
+  var fo = p.fieldOrder, recs = p.records, pk = null;
+  fo.forEach(function(f){ if (!pk && /complaint\s*type/i.test(f.key)) pk = f.key; });
+  if (!pk){
+    var need = Math.max(2, Math.ceil(recs.length * 0.6));
+    fo.forEach(function(f){
+      if (pk) return;
+      var seen = {}, n = 0;
+      recs.forEach(function(r){ var v = r.fields[f.key]; if (v && !seen[v]){ seen[v] = 1; n++; } });
+      if (n >= need) pk = f.key;
+    });
+  }
+  p.primaryKey = pk || (fo[0] && fo[0].key) || "";
+  var dk = "";
+  fo.forEach(function(f){ if (!dk && f.key !== p.primaryKey && /^(description|explanation|wait reason|definition)/i.test(f.key)) dk = f.key; });
+  p.descKey = dk;
+  return p;
+}
 function recordDisplayTitle(rec){
+  var pv = primaryValue(rec);
+  if (pv) return pv;
   var ct = fieldValue(rec, "Complaint Type");
   if (ct) return ct;
   var cat = fieldValue(rec, "Category");
@@ -475,14 +530,17 @@ function saveToast(msg){
    xlsx files give null. Treat all of them (and whitespace / nbsp) as empty. */
 function cellStr(v){
   if (v === null || v === undefined) return "";
-  return String(v).replace(/\u00a0/g, " ").trim();
+  return String(v).split("\u0001")[0].replace(/\u00a0/g, " ").trim();
 }
-
-/* Cleans a raw grid so a whole-sheet copy behaves like an exact-range copy:
-   - every cell becomes a string
-   - fully empty rows at the top/bottom are dropped
-   - fully empty columns on the left/right are dropped
-   - short rows are padded to the same width */
+/* A cell may carry a hyperlink after a \u0001 marker (added by gridToRows). */
+function cellLink(v){
+  var x = (v === null || v === undefined) ? "" : String(v), i = x.indexOf("\u0001");
+  return i < 0 ? "" : x.slice(i+1);
+}
+function cellFull(v){
+  var t = cellStr(v), l = cellLink(v);
+  return (l && t.indexOf(l) < 0) ? (t ? t + "\n\n" : "") + "🔗 " + l : t;
+}
 function normalizeGrid(rows){
   var grid = rows.map(function(r){ return (r || []).map(function(c){ return c === null || c === undefined ? "" : String(c); }); });
   function rowEmpty(r){ return r.every(function(c){ return cellStr(c) === ""; }); }
@@ -504,34 +562,45 @@ function normalizeGrid(rows){
     return out;
   });
 }
+function isNoteLabel(t){ return t.length <= 30 && /^\s*important\s*notes?/i.test(t); }
+function nnCount(r){ var n = 0; for (var i=0;i<r.length;i++) if (cellStr(r[i]) !== "") n++; return n; }
 
 /* ================= PARSING ================= */
 function parseWorkbookRows(rawRows){
-  var rows = normalizeGrid(rawRows);
+  var rows = normalizeGrid(rawRows), h, c, i, r;
 
-  // Locate the header row by content ("Complaint Type") instead of a fixed
-  // position, so blank rows above it (or a different layout) don't break import.
-  var hdrIdx = -1;
-  for (var h=0; h<Math.min(rows.length, 20) && hdrIdx<0; h++){
-    for (var c=0;c<rows[h].length;c++){
+  // 1) Header row found by content ("Complaint Type"); 2) otherwise detected by
+  // shape: skip "Important Notes" rows, and treat a short row followed by a much
+  // wider one as a group row. Nothing depends on fixed row numbers.
+  var hdrIdx = -1, groupIdx = -1;
+  for (h=0; h<Math.min(rows.length, 20) && hdrIdx<0; h++){
+    for (c=0;c<rows[h].length;c++){
       if (/complaint\s*type/i.test(cellStr(rows[h][c]))){ hdrIdx = h; break; }
     }
   }
-  if (hdrIdx < 0) hdrIdx = Math.min(2, Math.max(rows.length-1, 0));
+  if (hdrIdx >= 0){
+    if (hdrIdx >= 1 && !isNoteLabel(cellStr(rows[hdrIdx-1][0]))) groupIdx = hdrIdx-1;
+  } else {
+    var r0 = 0;
+    while (r0 < Math.min(rows.length, 6) && isNoteLabel(cellStr(rows[r0][0]))) r0++;
+    hdrIdx = Math.min(r0, Math.max(rows.length-1, 0));
+    var a = nnCount(rows[hdrIdx] || []), b = nnCount(rows[hdrIdx+1] || []);
+    if (rows[hdrIdx+1] && a >= 1 && b >= 2*a){ groupIdx = hdrIdx; hdrIdx++; }
+  }
 
-  var groupRow = hdrIdx >= 1 ? rows[hdrIdx-1] : [];
-  var importantNotes = [];
-  for (var n=0; n<=hdrIdx-2; n++){
+  var importantNotes = [], seenNote = {}, limit = groupIdx >= 0 ? groupIdx : hdrIdx;
+  for (var n=0; n<limit; n++){
     var nr = rows[n] || [];
-    if (nr.some(function(x){ return cellStr(x) !== ""; })){
-      importantNotes = nr.slice(1).map(cellStr).filter(Boolean);
-      break;
+    var hasLabel = nr.some(function(x){ return isNoteLabel(cellStr(x)); });
+    for (c = hasLabel ? 0 : 1; c<nr.length; c++){
+      var t = cellFull(nr[c]);
+      if (!t || isNoteLabel(cellStr(nr[c]))) continue;
+      if (!seenNote[t]){ seenNote[t] = 1; importantNotes.push(t); }
     }
   }
 
-  var groupForCol = [];
-  var lastGroup = "";
-  var i;
+  var groupRow = groupIdx >= 0 ? rows[groupIdx] : [];
+  var groupForCol = [], lastGroup = "";
   for (i=0;i<groupRow.length;i++){
     if (cellStr(groupRow[i]) !== "") lastGroup = cellStr(groupRow[i]);
     groupForCol[i] = lastGroup;
@@ -539,46 +608,256 @@ function parseWorkbookRows(rawRows){
 
   var headerRow = rows[hdrIdx] || [];
   var numCols = headerRow.length;
-  var fieldForCol = [];
-  var lastField = "";
+  var fieldForCol = [], lastField = "";
   for (i=0;i<numCols;i++){
     if (cellStr(headerRow[i]) !== "") lastField = cellStr(headerRow[i]);
     fieldForCol[i] = lastField;
   }
-
-  var fieldOrder = [];
-  var seen = {};
+  var fieldOrder = [], seen = {};
   for (i=0;i<numCols;i++){
     var f = fieldForCol[i];
     if (!f) continue;
     if (!seen[f]){
       seen[f] = true;
-      fieldOrder.push({ key:f, group: groupForCol[i] || "", cols:[i] });
+      fieldOrder.push({ key:f, group: groupForCol[i] || "", cols:[i], link: cellLink(headerRow[i]) });
     } else {
       var entry = fieldOrder.filter(function(e){ return e.key===f; })[0];
       if (entry) entry.cols.push(i);
     }
   }
 
-  var records = [];
-  var currentSection = "";
-  for (var r=hdrIdx+1;r<rows.length;r++){
+  // Sheets that repeat their column labels on later divider rows (e.g. several
+  // template tables stacked in one tab) use the header's first cell as the
+  // name of the first section.
+  // A divider row has a name in col0, nothing in col1 (col0 may be merged over
+  // it) and no data of its own - at most a repeat of the column labels and one
+  // stray cell. Stray text is never dropped: it is kept as a note on the section.
+  function divInfo(rw){
+    if (!cellStr(rw[0]) || cellStr(rw[1])) return null;
+    var strays = [], hit = 0;
+    for (var k=2;k<rw.length;k++){
+      var x = cellStr(rw[k]);
+      if (!x) continue;
+      if (x === cellStr(headerRow[k])) hit++; else strays.push(k);
+    }
+    return strays.length <= 1 ? { strays: strays, hit: hit } : null;
+  }
+  var initialSection = "", repeats = false;
+  for (r=hdrIdx+1; r<rows.length && !repeats; r++){
+    var di0 = divInfo(rows[r]);
+    if (di0 && di0.hit >= 2) repeats = true;
+  }
+  if (repeats && fieldOrder.length && fieldOrder[0].cols.indexOf(0) >= 0){
+    initialSection = fieldOrder[0].key;
+    fieldOrder[0].key = "Inquiry";
+  }
+
+  var records = [], currentSection = initialSection;
+  for (r=hdrIdx+1; r<rows.length; r++){
     var row = rows[r] || [];
     if (row.every(function(x){ return cellStr(x) === ""; })) continue;
-    var col0 = cellStr(row[0]);
-    var col1 = cellStr(row[1]);
-    // A category/section divider row has a category name in col0 but no
-    // Complaint Type in col1.
-    if (col0 && !col1){ currentSection = col0; continue; }
+    var di = divInfo(row);
+    if (di){
+      currentSection = cellStr(row[0]);
+      di.strays.forEach(function(k){
+        var t = cellFull(row[k]);
+        if (t) importantNotes.push(currentSection + " › " + (cellStr(fieldForCol[k] || "").split("\n")[0]) + ": " + t);
+      });
+      continue;
+    }
     var record = { _section: currentSection, _row: r+1, fields:{} };
     for (var fi=0; fi<fieldOrder.length; fi++){
       var fo = fieldOrder[fi];
-      var vals = fo.cols.map(function(ci){ return cellStr(row[ci]); }).filter(Boolean);
+      var vals = fo.cols.map(function(ci){ return cellFull(row[ci]); }).filter(Boolean);
       if (vals.length) record.fields[fo.key] = vals.join("\n\n");
     }
     if (Object.keys(record.fields).length) records.push(record);
   }
-  return { importantNotes: importantNotes, fieldOrder: fieldOrder, records: records };
+  return { importantNotes: importantNotes, fieldOrder: fieldOrder, records: records,
+           hasGroup: groupIdx >= 0, hasSections: records.some(function(x){ return !!x._section; }) };
+}
+
+/* ================= WORKBOOK (.xlsx upload): every tab ================= */
+// Reads one sheet into cells {v,l,rs,cs} (text, hyperlink, row/col span) or {cov:[r,c]} for merged-over cells.
+function readSheetGrid(ws){
+  if (!ws || !ws["!ref"]) return [];
+  var rg = XLSX.utils.decode_range(ws["!ref"]), R = rg.e.r+1, C = rg.e.c+1, g = [], r;
+  for (r=0;r<R;r++) g.push(new Array(C).fill(null));
+  Object.keys(ws).forEach(function(k){
+    if (k.charAt(0) === "!") return;
+    var a = XLSX.utils.decode_cell(k), cell = ws[k];
+    if (!cell || a.r >= R || a.c >= C) return;
+    var v = cell.w !== undefined ? cell.w : (cell.v === undefined || cell.v === null ? "" : String(cell.v));
+    var l = cell.l && cell.l.Target ? String(cell.l.Target) : "";
+    if (v === "" && !l) return;
+    g[a.r][a.c] = { v:String(v), l:l, rs:1, cs:1 };
+  });
+  (ws["!merges"] || []).forEach(function(m){
+    if (m.s.r >= R || m.s.c >= C) return;
+    var master = g[m.s.r][m.s.c];
+    if (!master) return;
+    master.rs = Math.min(m.e.r, R-1) - m.s.r + 1;
+    master.cs = Math.min(m.e.c, C-1) - m.s.c + 1;
+    for (var rr=m.s.r; rr<=Math.min(m.e.r,R-1); rr++)
+      for (var cc=m.s.c; cc<=Math.min(m.e.c,C-1); cc++)
+        if (rr !== m.s.r || cc !== m.s.c) g[rr][cc] = { cov:[m.s.r, m.s.c] };
+  });
+  var fr = -1, lr = -1, fc = Infinity, lc = -1;
+  g.forEach(function(row, ri){ row.forEach(function(x, ci){
+    if (x && !x.cov){ if (fr < 0) fr = ri; lr = ri; if (ci < fc) fc = ci; if (ci > lc) lc = ci; }
+  }); });
+  if (fr < 0) return [];
+  return g.slice(fr, lr+1).map(function(row){
+    return row.slice(fc, lc+1).map(function(x){
+      return x && x.cov ? { cov:[x.cov[0]-fr, x.cov[1]-fc] } : x;
+    });
+  });
+}
+// Flat text rows for the case parser: vertically merged cells repeat their value, links ride along after \u0001.
+function gridToRows(g){
+  return g.map(function(row, r){
+    return row.map(function(x, c){
+      if (!x) return "";
+      if (x.cov){
+        var m = g[x.cov[0]] && g[x.cov[0]][x.cov[1]];
+        return (m && x.cov[1] === c) ? m.v : "";
+      }
+      return x.v + (x.l && /^(https?:\/\/|mailto:)/i.test(x.l) ? "\u0001" + x.l : "");
+    });
+  });
+}
+function buildTabs(wb){
+  var tabs = [];
+  wb.SheetNames.forEach(function(name){
+    var tab = { name:name, kind:"table", view:"smart", grid:[], kb:null, skip:{} };
+    try{
+      try{ tab.grid = readSheetGrid(wb.Sheets[name]); }
+      catch(e1){
+        console.error("grid", name, e1);
+        tab.grid = XLSX.utils.sheet_to_json(wb.Sheets[name], { header:1, defval:"", raw:false }).map(function(row){
+          return row.map(function(v){ return v === "" || v === null ? null : { v:String(v), l:"", rs:1, cs:1 }; });
+        });
+      }
+      for (var r=0; r<Math.min(tab.grid.length,4); r++){
+        var first = tab.grid[r].filter(function(x){ return x && !x.cov && x.v; })[0];
+        if (first && isNoteLabel(first.v.trim())) tab.skip[r] = true;
+      }
+      var p = finalizeKB(parseWorkbookRows(gridToRows(tab.grid)));
+      tab.kb = p;
+      var longF = p.fieldOrder.filter(function(f){
+        var L = p.records.map(function(x){ return (x.fields[f.key] || "").length; }).sort(function(x,y){ return x-y; });
+        return L.length && L[L.length >> 1] > 120;
+      }).length;
+      if (p.records.length >= 2 && p.fieldOrder.length >= 4 && longF >= 2 &&
+          (p.fieldOrder.length >= 6 || p.hasGroup || p.hasSections)) tab.kind = "cases";
+    } catch(err){ console.error("tab", name, err); }
+    if (!tab.kb) tab.kb = { importantNotes:[], fieldOrder:[], records:[], primaryKey:"", descKey:"" };
+    tabs.push(tab);
+  });
+  return tabs;
+}
+function activeTab(){ return state.workbook ? state.workbook.tabs[state.activeTab] : null; }
+function tabIsTable(){ var t = activeTab(); return !!t && (t.kind !== "cases" || t.view === "table"); }
+function activateTab(i){
+  var t = state.workbook.tabs[i];
+  state.activeTab = i; state.kb = t.kb;
+  state.activeSection = null; state.activeComplaintType = null;
+  state.expandedSections = {}; state.openRecordId = null; state.notesOpen = false;
+  var pi = -1;
+  t.kb.fieldOrder.forEach(function(f, k){ if (pi < 0 && f.key === t.kb.primaryKey) pi = k; });
+  state.scopeField = (t.kind === "cases" && pi >= 0) ? String(pi) : "ALL";
+  render();
+}
+function applyWorkbook(tabs, sourceLabel){
+  var def = -1;
+  tabs.forEach(function(t, i){ if (def < 0 && /customer\s*complaints?/i.test(t.name)) def = i; });
+  if (def < 0) tabs.forEach(function(t, i){ if (def < 0 && t.kind === "cases") def = i; });
+  state.workbook = { tabs: tabs, fileName: sourceLabel };
+  state.query = "";
+  activateTab(Math.max(def, 0));
+  saveToast("Imported " + tabs.length + " tab" + (tabs.length === 1 ? "" : "s") + " from " + sourceLabel);
+}
+
+/* ---------- Table view (lossless, honours merged cells, links, long text) ---------- */
+function tableRowMatches(tab){
+  var q = normalize(state.query.trim()), out = [];
+  tab.grid.forEach(function(row, r){
+    if (tab.skip[r]) return;
+    var txt = [], any = false;
+    row.forEach(function(c){ if (c && !c.cov && (c.v || c.l)){ any = true; txt.push(c.v); } });
+    if (!any) return;
+    if (q && normalize(txt.join(" \n ")).indexOf(q) === -1) return;
+    out.push(r);
+  });
+  return out;
+}
+function cellInner(c, q){
+  var t = c.v || "", l = c.l || "", inner, hl = function(x){ return q ? highlight(x, q) : esc(x); };
+  if (l && /^(https?:|mailto:)/i.test(l)){
+    inner = t.length > 40
+      ? linkify(hl(t)) + ' <a href="'+esc(l)+'" target="_blank" rel="noopener noreferrer">🔗 Open link</a>'
+      : '<a href="'+esc(l)+'" target="_blank" rel="noopener noreferrer">'+hl(t || l)+'</a>';
+  } else if (l){
+    var nm = (l.match(/^#'?([^'!]+)'?!/) || [])[1];
+    inner = nm ? '<a href="#" data-goto="'+esc(nm)+'">'+hl(t || nm)+'</a>' : hl(t);
+  } else inner = linkify(hl(t));
+  inner = '<div dir="auto">' + inner + '</div>';
+  if (t.length > 240 || t.split("\n").length > 7)
+    inner = '<div class="xt-clamp'+(q?' open':'')+'">'+inner+'</div><button class="xt-more" data-more>'+(q?'Show less':'Show more')+'</button>';
+  return inner;
+}
+function renderTableView(tab){
+  var g = tab.grid, idx = tableRowMatches(tab), q = state.query.trim(), flat = !!q;
+  if (!idx.length)
+    return '<div class="empty" style="padding-top:60px;"><h2>'+(g.length ? 'No matches' : 'This tab is empty')+'</h2></div>';
+  var W = 0; g.forEach(function(r){ if (r.length > W) W = r.length; });
+  var blank = g.map(function(r){ return r.every(function(x){ return !x; }); });
+  var h = '<div class="xt-wrap"><table class="xt">', prev = -1;
+  idx.forEach(function(r, k){
+    var row = g[r], gap = false, x;
+    for (x=prev+1; x<r; x++) if (blank[x]) gap = true;
+    var masters = row.filter(function(c){ return c && !c.cov && (c.v || c.l); });
+    var isHead = (k === 0 || gap) && masters.length >= 2;
+    var isTitle = masters.length === 1 && (masters[0].cs > 1 || (k === 0 && W > 2));
+    h += '<tr>';
+    if (isTitle){
+      h += '<td class="xt-title" colspan="'+Math.max(W,1)+'">'+cellInner(masters[0], q)+'</td>';
+    } else {
+      for (var c=0; c<row.length; c++){
+        var cl = row[c], tag = isHead ? 'th' : 'td';
+        if (cl && cl.cov){
+          if (flat && cl.cov[0] < r && cl.cov[1] === c){
+            var m = g[cl.cov[0]][cl.cov[1]];
+            h += '<td'+(m.cs > 1 ? ' colspan="'+Math.min(m.cs, row.length-c)+'"' : '')+'>'+cellInner(m, q)+'</td>';
+          }
+          continue;
+        }
+        if (!cl || (!cl.v && !cl.l)){ h += '<'+tag+'></'+tag+'>'; continue; }
+        var span = ' colspan="'+Math.min(cl.cs, row.length-c)+'"';
+        if (!flat && cl.rs > 1){
+          var rsEff = idx.filter(function(z){ return z >= r && z < r + cl.rs; }).length;
+          if (rsEff > 1) span += ' rowspan="'+rsEff+'"';
+        }
+        h += '<'+tag+(cl.cs > 1 ? span : span.replace(/ colspan="1"/, ''))+'>'+cellInner(cl, q)+'</'+tag+'>';
+      }
+    }
+    h += '</tr>';
+    prev = r;
+  });
+  return h + '</table></div>';
+}
+function viewSwitch(tab){
+  if (tab.kind !== "cases") return "";
+  return '<div class="viewsw"><button data-view="smart" class="'+(tab.view !== "table" ? 'on' : '')+'">Cards</button>'+
+         '<button data-view="table" class="'+(tab.view === "table" ? 'on' : '')+'">Table</button></div>';
+}
+function renderTabs(){
+  if (!state.workbook) return "";
+  var h = '<div class="tabbar" role="tablist">';
+  state.workbook.tabs.forEach(function(t, i){
+    h += '<button class="tab'+(i === state.activeTab ? ' active' : '')+'" data-tab="'+i+'" role="tab">'+esc(t.name.trim() || ("Sheet " + (i+1)))+'</button>';
+  });
+  return h + '</div>';
 }
 
 function applyParsedKB(parsed, sourceLabel){
@@ -586,10 +865,10 @@ function applyParsedKB(parsed, sourceLabel){
     saveToast("No rows found — check the data includes the category/header rows, not just case rows.");
     return false;
   }
-  state.kb = parsed;
+  finalizeKB(parsed); state.workbook = null; state.kb = parsed;
   state.query=""; state.activeSection=null;
   var ctIdx = -1;
-  parsed.fieldOrder.forEach(function(f, i){ if (ctIdx < 0 && /complaint\s*type/i.test(f.key)) ctIdx = i; });
+  parsed.fieldOrder.forEach(function(f, i){ if (ctIdx < 0 && f.key === parsed.primaryKey) ctIdx = i; });
   state.scopeField = ctIdx >= 0 ? String(ctIdx) : "ALL"; state.activeComplaintType=null;
   state.expandedSections = {}; state.openRecordId = null;
   render();
@@ -603,13 +882,9 @@ function parseFile(file){
     try{
       var data = new Uint8Array(e.target.result);
       var wb = XLSX.read(data, { type:"array" });
-      var best = null;
-      wb.SheetNames.forEach(function(name){
-        var rows = XLSX.utils.sheet_to_json(wb.Sheets[name], { header:1, defval:null, raw:false });
-        var p = parseWorkbookRows(rows);
-        if (!best || p.records.length > best.records.length) best = p;
-      });
-      applyParsedKB(best, file.name);
+      var tabs = buildTabs(wb);
+      if (!tabs.length) throw new Error("no sheets");
+      applyWorkbook(tabs, file.name);
     } catch(err){
       console.error(err);
       saveToast("Couldn't read that file. Make sure it's a .xlsx export of the KB.");
@@ -675,7 +950,7 @@ function searchRecords(){
 
   var filtered = recs.filter(function(rec){
     if (state.activeSection && rec._section !== state.activeSection) return false;
-    if (state.activeComplaintType && fieldValue(rec,"Complaint Type") !== state.activeComplaintType) return false;
+    if (state.activeComplaintType && primaryValue(rec) !== state.activeComplaintType) return false;
     return true;
   });
 
@@ -747,7 +1022,7 @@ function complaintTypesFor(section){
   var seen = {}; var out = [];
   state.kb.records.forEach(function(r){
     if (r._section !== section) return;
-    var ct = fieldValue(r,"Complaint Type");
+    var ct = primaryValue(r);
     if (ct && !seen[ct]){ seen[ct]=true; out.push(ct); }
   });
   return out;
@@ -756,7 +1031,8 @@ function complaintTypesFor(section){
 function renderShell(empty){
   var html = "";
   html += renderTopbar();
-  html += '<div class="body">';
+  html += renderTabs();
+  html += '<div class="body'+(tabIsTable()?' no-sidebar':'')+'">';
   html += renderSidebar(empty);
   html += '<div class="main">' + (empty ? renderEmpty() : renderMain()) + '</div>';
   html += '</div>';
@@ -771,7 +1047,7 @@ function renderShell(empty){
 }
 
 function renderTopbar(){
-  var count = state.kb ? searchRecords().length : 0;
+  var count = state.kb ? (tabIsTable() ? tableRowMatches(activeTab()).length : searchRecords().length) : 0;
   return (
   '<div class="topbar">'+
     '<div class="brand">'+
@@ -787,7 +1063,7 @@ function renderTopbar(){
         '<input id="searchInput" placeholder="Search cases, scripts, refund rules…" value="'+esc(state.query)+'" autocomplete="off">'+
         (state.query ? '<button class="btn ghost" id="clearSearch" style="padding:2px 6px;">✕</button>' : '')+
       '</div>'+
-      (state.kb ? renderScopeSelect() : '')+
+      (state.kb && !tabIsTable() ? renderScopeSelect() : '')+
     '</div>'+
     '<div class="count-pill">'+(state.kb ? count + ' match' + (count===1?'':'es') : '')+'</div>'+
     '<div class="topbar-actions">'+
@@ -830,6 +1106,13 @@ function scopeKeyResolved(){
 function renderSidebar(empty){
   if (empty) return '<div class="sidebar" id="sidebar"></div>';
   var sections = sectionsList();
+  if (sections.length === 1 && sections[0] === ""){
+    var fh = '<div class="sidebar" id="sidebar"><div class="sidebar-title">Cases</div><div class="sub-list" style="padding:0">';
+    complaintTypesFor("").forEach(function(ct){
+      fh += '<button class="sub-item '+(state.activeComplaintType===ct?'active':'')+'" data-sec="" data-ct="'+esc(ct)+'">'+esc(ct)+'</button>';
+    });
+    return fh + '</div><div class="sidebar-foot"><button class="notes-btn" id="notesBtnSide">💡 Important Notes</button></div></div>';
+  }
   var html = '<div class="sidebar" id="sidebar"><div class="sidebar-title">Categories</div>';
   sections.forEach(function(sec){
     var count = state.kb.records.filter(function(r){ return r._section===sec; }).length;
@@ -876,8 +1159,10 @@ function renderEmpty(){
 }
 
 function renderMain(){
+  var tab = activeTab();
+  if (tab && tabIsTable()) return viewSwitch(tab) + renderTableView(tab);
   var results = searchRecords();
-  var html = "";
+  var html = tab ? viewSwitch(tab) : "";
 
   var chips = [];
   if (state.activeSection) chips.push({label: state.activeSection, key:'section'});
@@ -903,7 +1188,7 @@ function renderMain(){
     var rec = item.rec;
     var crit = isCritical(rec._section);
     var title = recordDisplayTitle(rec);
-    var desc = fieldValue(rec,"Description");
+    var desc = descValue(rec);
     html += '<button class="card '+(crit?'critical':'')+'" data-open="'+idx+'" data-id="'+rec._row+'">'+
       '<div class="card-top"><span class="card-section">'+esc(rec._section.replace(/\s*\(Critical\)/,''))+'</span><span class="card-tag">#'+String(rec._row).padStart(3,'0')+'</span></div>'+
       '<div class="card-title">'+esc(title)+'</div>'+
@@ -925,13 +1210,13 @@ function renderDrawer(){
 
   var crit = isCritical(rec._section);
   var title = recordDisplayTitle(rec);
-  var desc = fieldValue(rec,"Description");
+  var desc = descValue(rec);
 
   var html = '<div class="drawer show" id="drawer">';
   html += '<div class="drawer-head">'+
     '<div class="drawer-stripe '+(crit?'critical':'')+'"></div>'+
     '<div class="drawer-head-text">'+
-      '<div class="drawer-eyebrow">'+esc(rec._section)+' · Case #'+String(rec._row).padStart(3,'0')+'</div>'+
+      '<div class="drawer-eyebrow">'+(rec._section ? esc(rec._section)+' · ' : '')+'Case #'+String(rec._row).padStart(3,'0')+'</div>'+
       '<div class="drawer-title">'+esc(title)+'</div>'+
       (desc ? '<div class="drawer-desc" dir="auto">'+esc(desc)+'</div>' : '')+
     '</div>'+
@@ -941,7 +1226,7 @@ function renderDrawer(){
 
   var orderedFields = state.kb.fieldOrder.filter(function(f){
     var k = f.key.toLowerCase();
-    return k.indexOf("complaint type")!==0 && k.indexOf("category")!==0 && k.indexOf("description")!==0;
+    return f.key !== state.kb.primaryKey && f.key !== state.kb.descKey && k.indexOf("category")!==0;
   });
   // Fixed display order after "CST Required Info", identified by header name (not
   // column position) so this stays correct no matter how columns are ordered,
@@ -979,12 +1264,12 @@ function renderDrawer(){
     }
     var h = splitHeader(f.key);
     var val = rec.fields[f.key];
-    var copyable = /script|ticket|note/i.test(h.en);
+    var copyable = /script|ticket|note|template|step|نماذج|سكريبت/i.test(h.en) || val.length > 160;
     var highlighted = /^refund needed/i.test(h.en);
     var highlightedAlt = /^compensation needed/i.test(h.en);
     var fidx = state.kb.fieldOrder.indexOf(f);
     html += '<div class="field '+(highlighted?'is-highlighted':'')+(highlightedAlt?'is-highlighted-alt':'')+'">'+
-      '<div class="field-label-row"><div><span class="field-label">'+esc(h.en)+'</span>'+
+      '<div class="field-label-row"><div>'+(f.link && /^(https?:|mailto:)/i.test(f.link) ? '<a class="field-label" href="'+esc(f.link)+'" target="_blank" rel="noopener noreferrer">'+esc(h.en)+'</a>' : '<span class="field-label">'+esc(h.en)+'</span>')+
         (highlightedAlt?' <span class="comp-badge" aria-hidden="true">🎁</span>':'')+
         (h.ar?' <span class="field-label-ar">'+esc(h.ar)+'</span>':'')+'</div>'+
         (copyable?'<button class="copy-btn" data-copy-idx="'+fidx+'">Copy</button>':'')+
@@ -993,7 +1278,7 @@ function renderDrawer(){
         (highlightedAlt?'<svg class="comp-orbit-svg" aria-hidden="true"><rect class="comp-orbit-rect" x="0" y="0" width="100%" height="100%" rx="9" pathLength="100"/></svg>':'')+
         val.split(/\n\n+/).map(function(line){
           var rtl = isRTLText(line);
-          return '<p class="fval-line" dir="'+(rtl?'rtl':'auto')+'">'+esc(line)+'</p>';
+          return '<p class="fval-line" dir="'+(rtl?'rtl':'auto')+'">'+linkify(esc(line))+'</p>';
         }).join('')+
       '</div>'+
     '</div>';
@@ -1014,7 +1299,7 @@ function renderNotesModal(){
       '<div class="modal-body">'+
         state.kb.importantNotes.map(function(n){
           var rtl = isRTLText(n);
-          return '<div class="note-block" dir="'+(rtl?'rtl':'auto')+'">'+esc(n)+'</div>';
+          return '<div class="note-block" dir="'+(rtl?'rtl':'auto')+'">'+linkify(esc(n))+'</div>';
         }).join('')+
       '</div>'+
     '</div>'+
@@ -1120,6 +1405,27 @@ function bindEvents(){
       render();
       var scrim = document.getElementById("scrim");
       if (scrim) scrim.classList.add("show");
+    });
+  });
+
+  document.querySelectorAll("[data-tab]").forEach(function(b){
+    b.addEventListener("click", function(){ activateTab(parseInt(b.getAttribute("data-tab"), 10)); });
+  });
+  document.querySelectorAll("[data-view]").forEach(function(b){
+    b.addEventListener("click", function(){ var t = activeTab(); if (t){ t.view = b.getAttribute("data-view"); state.activeSection = null; state.activeComplaintType = null; render(); } });
+  });
+  document.querySelectorAll("[data-more]").forEach(function(b){
+    b.addEventListener("click", function(){
+      var d = b.previousElementSibling; if (!d) return;
+      var open = d.classList.toggle("open"); b.textContent = open ? "Show less" : "Show more";
+    });
+  });
+  document.querySelectorAll("[data-goto]").forEach(function(a){
+    a.addEventListener("click", function(e){
+      e.preventDefault();
+      var nm = a.getAttribute("data-goto").trim().toLowerCase();
+      var i = state.workbook ? state.workbook.tabs.findIndex(function(t){ return t.name.trim().toLowerCase() === nm; }) : -1;
+      if (i >= 0) activateTab(i);
     });
   });
 
